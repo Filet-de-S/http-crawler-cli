@@ -1,0 +1,26 @@
+//  protoc --go_out=plugins=grpc:. uniqURL_db.proto
+
+syntax = "proto3";
+package uniqURL_db;
+option go_package = "/grpc_client";
+
+service parsed {
+  rpc get (getURL) returns (getResult) {}
+  rpc save(saveURL) returns (nothing) {}
+}
+
+message getURL {
+  string url = 1;
+}
+
+message getResult {
+  int32 depth = 1;
+  bool exists = 2;
+}
+
+message saveURL {
+  string url = 1;
+  int32 depth = 2;
+}
+
+message nothing {}
