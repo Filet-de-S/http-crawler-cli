@@ -2,6 +2,10 @@ package main
 
 import (
 	"bufio"
+	"context"
+	_urlStore "crawler/uniqURL_db"
+	"crawler/uniqURL_db/grpc_client"
+	"crawler/uniqURL_db/stdmap"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -9,7 +13,6 @@ import (
 	url_ "net/url"
 	"os"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -21,19 +24,19 @@ import (
 var (
 	workersNum              int
 	rootPage                string
-	totalDepth              int
+	totalDepth              int32
 	header                  http.Header
-	tryAllowed              int
+	tryAllowed              int32
 	omitExt                 []string
 	defaultExtNeeded        bool
 	deltaSuccess            float32
 	deltaFail               float32
-	chanCapOnDepthHeuristic int
-	uniqueCounter           int
-	uniqueStorage           parsed
+	chanCapOnDepthHeuristic int32
+	uniqueCounter           int64
+	urlStore                _urlStore.Parsed
 	minHalt                 int64
 	maxHalt                 int64
-	fdRes                   *os.File
+	resFile                 *os.File
 	logFile                 *os.File
 	client                  *http.Client
 	rgx                     *regexp.Regexp
@@ -41,58 +44,56 @@ var (
 )
 
 const (
-	workersPerLogCPUdef = 6
-	clientTimeoutDef    = 2000
-	retryDef            = 0
-	haltMinMaxDef       = "200,500"
-	deltaOKfailDef      = "1,-2"
+	workersDef       = 48
+	clientTimeoutDef = 5000
+	retryDef         = 1
+	haltMinMaxDef    = "0,500"
+	deltaOKfailDef   = "1,-10"
 )
 
 type url = string
 
 type urlStruct struct {
 	url    url
-	depth  int
-	trying int
+	depth  int32
+	trying int32
 }
 
 type urlPrint struct {
 	url        url
-	depth      int
-	delOnDepth int
+	depth      int32
+	delOnDepth int32
 }
 
 type newURLs struct {
 	urls  []url
-	depth int
-}
-
-type stdMAP struct {
-	hash map[url]int
-}
-
-type parsed interface {
-	getByURL(url url) (depth int, exists bool, err error)
-	saveByURL(url url, depth int) error
-	//getTotal
+	depth int32
 }
 
 type ctx struct {
-	parsed      parsed
+	ctx_ 		context.Context
+	parsed      _urlStore.Parsed
+
 	reqURLs     chan urlStruct
 	printer     chan urlPrint
 	forwarder   chan newURLs
+
 	queue       int32
 	printQue    []int32
+
 	reqStatus   chan float32
 	dynamicHalt int64
+	lastHalt	int64
+
+	now 		time.Time
 }
 
 func main() {
-	defer fdRes.Close()
-	defer logFile.Close()
+	ctx, done := start()
 
-	ctx, done, now := start()
+	defer resFile.Close()
+	defer logFile.Close()
+	defer ctx.parsed.Close()
 
 	for range time.Tick(100 * time.Millisecond) {
 		if atomic.LoadInt32(&ctx.queue) == 0 {
@@ -106,7 +107,7 @@ func main() {
 	}
 
 	<-done
-	_, err := fmt.Fprintln(fdRes, uniqueCounter)
+	_, err := fmt.Fprintln(resFile, uniqueCounter)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"type": "writing result",
@@ -116,18 +117,21 @@ func main() {
 
 	log.WithFields(log.Fields{
 		"total": uniqueCounter,
-		"time":  time.Since(now)}).
+		"in time":  time.Since(ctx.now)}).
 		Info("done")
 }
 
-func start() (*ctx, chan bool, time.Time) {
+func start() (*ctx, chan bool) {
 	ctx := &ctx{
-		parsed:    uniqueStorage,
+		ctx_: context.Background(),
+		parsed:    urlStore,
 		reqURLs:   make(chan urlStruct, chanCapOnDepthHeuristic),
 		forwarder: make(chan newURLs, chanCapOnDepthHeuristic),
 		printer:   make(chan urlPrint, 1024+workersNum),
-		reqStatus: make(chan float32, workersNum),
 		printQue:  make([]int32, totalDepth+1),
+		reqStatus: make(chan float32, workersNum),
+		dynamicHalt: minHalt,
+		lastHalt: minHalt,
 	}
 
 	ctx.forwarder <- newURLs{
@@ -138,7 +142,23 @@ func start() (*ctx, chan bool, time.Time) {
 
 	done := make(chan bool)
 
-	now := time.Now()
+	log.WithFields(log.Fields{
+		"workers": workersNum,
+		"minHalt": minHalt,
+		"maxHalt": maxHalt,
+		"deltaOK": deltaSuccess,
+		"deltaFAIL": deltaFail,
+		"writingResTo": resFile.Name(),
+		"header": header,
+		"rootPage": rootPage,
+		"depth": totalDepth,
+		"client-timeout": client.Timeout,
+		"retry": tryAllowed,
+		"omit-ext": omitExt,
+		"defaultExtNeeded": defaultExtNeeded,
+	}).Info("start")
+
+	ctx.now = time.Now()
 	for i := 0; i < workersNum; i++ {
 		go queryWorker(ctx)
 	}
@@ -146,31 +166,29 @@ func start() (*ctx, chan bool, time.Time) {
 	go haltCtrl(ctx)
 	go printURLsInLive(ctx, done)
 
-	return ctx, done, now
+	return ctx, done
 }
 
-
-//case: uniqueUrlName (lvl = 10) <= 10 --> !visited
-//									   --> map[url]depth
-//									   --> newDepth > totalDepth
-//									   --> not parse
-
-//case: uniqueUrlName (lvl = 02) <= 10 --> visited, but is not parsed,
-//										   if oldDepth is totalDepth
-//									   --> upd to newDepth
-//									   --> parse
 func queryWorker(ctx *ctx) {
+	var dyn int64
 	for toVisit := range ctx.reqURLs {
 
 		newDepth := toVisit.depth + 1
 		if newDepth <= totalDepth && needParse(toVisit.url){
-			go func(u urlStruct) {
+			go func(urls []url) {
 				ctx.forwarder <- newURLs{
 					depth: newDepth,
-					urls:  parseURL(ctx, u),
+					urls:  urls,
 				}
-			}(toVisit)
-			time.Sleep(time.Duration(atomic.LoadInt64(&ctx.dynamicHalt)))
+			}(parseURL(ctx, toVisit))
+
+			dyn = atomic.LoadInt64(&ctx.dynamicHalt)
+			if dyn != atomic.LoadInt64(&ctx.lastHalt) {
+				atomic.StoreInt64(&ctx.lastHalt, dyn)
+
+				log.Debug("sleep for", time.Duration(dyn))
+				time.Sleep(time.Duration(dyn))
+			}
 
 		} else {
 			atomic.AddInt32(&ctx.printQue[toVisit.depth], -1)
@@ -182,7 +200,7 @@ func queryWorker(ctx *ctx) {
 func forwardNewURLs(ctx *ctx) {
 	var err error
 	var n int32 = 0
-	var oldDepth int
+	var oldDepth int32
 	var urlVisited bool
 
 	for newURLsPack := range ctx.forwarder {
@@ -194,8 +212,7 @@ func forwardNewURLs(ctx *ctx) {
 				log.WithFields(log.Fields{
 					"type": "unique storage get",
 					"err:": err,
-				}).Warn()
-				continue
+				}).Panic()
 			}
 
 			// !urlVisited || url[pseudo]Visited, not parsed
@@ -205,8 +222,7 @@ func forwardNewURLs(ctx *ctx) {
 					log.WithFields(log.Fields{
 						"type": "unique storage save",
 						"err:": err,
-					}).Warn()
-					continue
+					}).Panic()
 				}
 
 				forward(ctx, url, urlVisited, newURLsPack.depth, oldDepth)
@@ -220,7 +236,7 @@ func forwardNewURLs(ctx *ctx) {
 
 }
 
-func forward(ctx *ctx, url url, urlVisited bool, newDepth, oldDepth int) {
+func forward(ctx *ctx, url url, urlVisited bool, newDepth, oldDepth int32) {
 	//To exclude case when data is sent and depth is 0, which allows to print. Incr before sent
 	atomic.AddInt32(&ctx.printQue[newDepth], 1)
 
@@ -235,6 +251,8 @@ func forward(ctx *ctx, url url, urlVisited bool, newDepth, oldDepth int) {
 			url:        url,
 			delOnDepth: oldDepth,
 		}
+		atomic.AddInt32(&ctx.printQue[oldDepth], -1)
+
 	} else {
 		uniqueCounter++
 
@@ -242,31 +260,11 @@ func forward(ctx *ctx, url url, urlVisited bool, newDepth, oldDepth int) {
 			depth: newDepth,
 			url:   url,
 		}
-	}
-}
 
-func saveByURL(ctx *ctx, url url, depth int) (err error) {
-	for i := 0; i < 2; i++ {
-		err = ctx.parsed.saveByURL(url, depth)
-		if err == nil {
-			return
+		if uniqueCounter % 1001 == 0 {
+			log.Debug("UNIQUE FOUND", uniqueCounter, time.Since(ctx.now))
 		}
-
-		time.Sleep(100*time.Millisecond)
 	}
-	return
-}
-
-func getByURL(ctx *ctx, url url) (oldDepth int, urlVisited bool, err error) {
-	for i := 0; i < 2; i++ {
-		oldDepth, urlVisited, err = ctx.parsed.getByURL(url)
-		if err == nil {
-			return
-		}
-
-		time.Sleep(100*time.Millisecond)
-	}
-	return
 }
 
 func needParse(u url) bool {
@@ -302,12 +300,19 @@ func parseURL(ctx *ctx, url urlStruct) (foundURLs []string) {
 	}
 	req.Header = header
 
+	trySuccess := false
+	if url.trying > 0 {
+		trySuccess = true
+		time.Sleep(time.Duration(
+			atomic.LoadInt64(&ctx.dynamicHalt)))
+	}
+
 	resp, err := client.Do(req)
-	if err != nil { //|| resp.StatusCode != 200 {
+	if err != nil {
 		ctx.reqStatus <- deltaFail
 		again := retry(ctx, url)
 		log.WithFields(log.Fields{
-			"type":  "bad request",
+			"type":  "fail request",
 			"err":   err,
 			"retry": again,
 		}).Warn()
@@ -315,11 +320,18 @@ func parseURL(ctx *ctx, url urlStruct) (foundURLs []string) {
 	}
 	defer resp.Body.Close()
 
+	if trySuccess {
+		log.WithFields(log.Fields{
+			"retry n": url.trying,
+			"url": url.url,
+		}).Info("retry success")
+	}
+
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		again := retry(ctx, url)
 		log.WithFields(log.Fields{
-			"type":  "response read",
+			"type":  "response read fail",
 			"err":   err,
 			"retry": again,
 			"url":   url.url,
@@ -406,6 +418,7 @@ func haltCtrl(ctx *ctx) {
 	var successRate, newRate float32
 	var ok bool
 	lastHalt := minHalt
+	newHalt := lastHalt
 
 	for delta := range ctx.reqStatus {
 		newRate = successRate + delta
@@ -418,12 +431,13 @@ func haltCtrl(ctx *ctx) {
 			successRate = newRate
 		}
 
-		lastHalt, ok = needHaltUpd(successRate, lastHalt)
-		if ok {
-			atomic.StoreInt64(&ctx.dynamicHalt, lastHalt)
-			successRate = 0
+		newHalt, ok = needHaltUpd(successRate, lastHalt)
+		if ok && newHalt != lastHalt {
+			atomic.StoreInt64(&ctx.dynamicHalt, newHalt)
 
-			log.WithField("time", time.Duration(lastHalt)).
+			lastHalt = newHalt
+			successRate = 0
+			log.WithField("time", time.Duration(newHalt)).
 				Info("new halt")
 		}
 	}
@@ -444,9 +458,9 @@ func needHaltUpd(sr float32, halt int64) (int64, bool) {
 
 func printURLsInLive(ctx *ctx, done chan bool) {
 	toPrint := make([][]string, totalDepth+1)
-	w := bufio.NewWriter(fdRes)
+	w := bufio.NewWriter(resFile)
 	var url urlPrint
-	var lastLevel = 1
+	var lastLevel int32 = 1
 	var starve = 1
 
 	for url = range ctx.printer {
@@ -463,7 +477,7 @@ func printURLsInLive(ctx *ctx, done chan bool) {
 	done <- true
 }
 
-func deleteOldValue(url url, depth int, toPrint *[][]string) {
+func deleteOldValue(url url, depth int32, toPrint *[][]string) {
 	for i, u := range (*toPrint)[depth] {
 		if u == url {
 			arr := (*toPrint)[depth]
@@ -475,14 +489,14 @@ func deleteOldValue(url url, depth int, toPrint *[][]string) {
 	}
 }
 
-func bufferAppend(ctx *ctx, w *bufio.Writer, toPrint *[][]string, lastLevel int) int {
+func bufferAppend(ctx *ctx, w *bufio.Writer, toPrint *[][]string, lastLevel int32) int32 {
 	for depth := lastLevel; depth <= totalDepth; depth++ {
 		readiness := atomic.LoadInt32(&ctx.printQue[depth])
 
 		if readiness == 0 && (*toPrint)[depth] != nil {
-			append_(&(*toPrint)[depth], depth, w)
+			append_(&(*toPrint)[depth], int(depth), w)
 		} else if (*toPrint)[depth] != nil {
-			append_(&(*toPrint)[depth], depth, w)
+			append_(&(*toPrint)[depth], int(depth), w)
 			return depth
 		}
 	}
@@ -511,29 +525,30 @@ func append_(arr *[]string, depth int, w *bufio.Writer) {
 	*arr = nil
 }
 
-func printURLsDeprecated(urls map[url]int) {
-	res := make([][]string, totalDepth+1)
-	for url, level := range urls {
-		res[level] = append(res[level], url)
-	}
-
-	for i := range res {
-		for j := range res[i] {
-			fmt.Fprintln(fdRes, i, res[i][j])
+func saveByURL(ctx *ctx, url url, depth int32) (err error) {
+	ratio := 500
+	for i := 0; i < 2; i++ {
+		err = ctx.parsed.Save(ctx.ctx_, url, depth)
+		if err == nil {
+			return
 		}
+
+		time.Sleep(time.Duration(ratio * i) * time.Millisecond)
 	}
+	return
 }
 
-func (m stdMAP) getByURL(url url) (depth int, exists bool, err error) {
-	oldDepth, urlVisited := m.hash[url]
+func getByURL(ctx *ctx, url url) (oldDepth int32, urlVisited bool, err error) {
+	ratio := 500
+	for i := 1; i <= 2; i++ {
+		oldDepth, urlVisited, err = ctx.parsed.Get(ctx.ctx_, url)
+		if err == nil {
+			return
+		}
 
-	return oldDepth, urlVisited, nil
-}
-
-func (m stdMAP) saveByURL(url url, depth int) error {
-	m.hash[url] = depth
-
-	return nil
+		time.Sleep(time.Duration(ratio * i) * time.Millisecond)
+	}
+	return
 }
 
 func init() {
@@ -541,11 +556,13 @@ func init() {
 
 	client = &http.Client{Timeout: time.Millisecond * time.Duration(fl.clientTimeout)}
 
-	if tryAllowed < 0 {
+	tryAllowed = int32(fl.try)
+	if fl.try < 0 {
 		tryAllowed = 0
 	}
 
-	chanCapOnDepthHeuristic = avgDepthNeeded()
+	totalDepth = int32(fl.totalDepth)
+	chanCapOnDepthHeuristic = getChanCapByDepth()
 
 	minHalt = int64(time.Millisecond * time.Duration(fl.minHalt))
 	maxHalt = int64(time.Millisecond * time.Duration(fl.maxHalt))
@@ -561,59 +578,16 @@ func init() {
 
 	headerInit(fl)
 
-	if fl.resultFile != "" {
-		var err error
-		fdRes, err = os.OpenFile(fl.resultFile,
-			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			defer logFile.Close()
-			log.Fatal("Can't open or create result file :", err)
-		}
-	} else {
-		fdRes = os.Stdout
-	}
-
-	//todo if redis or other staff is empty
-	// if not redis, initFrom implemented callingURL or gRPC :)
-	uniqueStorage = stdMAP{map[url]int{}}
-}
-
-type flags struct {
-	omitExtensions   []string
-	defaultExtNeeded bool
-	clientTimeout    int
-	headerFile       string
-	userAgent        string
-	minHalt          int
-	maxHalt          int
-	resultFile       string
-	logFile          string
-	deltaSuccess     float32
-	deltaFail        float32
-}
-
-func avgDepthNeeded() int {
-	n := workersNum
-	switch totalDepth {
-	case 1:
-		return n
-	case 2:
-		return 70 + n
-	case 3:
-		//70^2=4900
-		return 70*70 + n
-	default:
-		//70^3=343000
-		return 10000 + n
-	}
+	initDBs(fl)
 }
 
 func headerInit(fl flags) {
 	if fl.headerFile != "" {
 		f, err := os.Open(fl.headerFile)
 		if err != nil {
-			defer logFile.Close()
-			log.Fatal("Can't open header file :", err)
+			log.Error("Can't open header file :", err)
+			logFile.Close()
+			os.Exit(1)
 		}
 		defer f.Close()
 
@@ -631,12 +605,14 @@ func headerInit(fl flags) {
 			i++
 		}
 		if err := sc.Err(); err != nil {
-			defer logFile.Close()
-			log.Fatal("Can't read header file :", err)
+			log.Error("Can't read header file :", err)
+			logFile.Close()
+			os.Exit(1)
 		}
 		if (i-1)%2 != 0 {
-			defer logFile.Close()
-			log.Fatal("Check header file format. Must have even lines: `HeaderName` newline `HeaderValue`", err)
+			log.Error("Check header file format. Must have even lines: `HeaderName` newline `HeaderValue`", err)
+			logFile.Close()
+			os.Exit(1)
 		}
 
 		if fl.userAgent != "" {
@@ -648,32 +624,96 @@ func headerInit(fl flags) {
 	}
 }
 
+func initDBs(fl flags) {
+	{
+		if fl.resultFile != "" {
+			var err error
+			resFile, err = os.OpenFile(fl.resultFile,
+				os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				log.Error("Can't open or create result file :", err)
+				logFile.Close()
+				os.Exit(1)
+			}
+		} else {
+			resFile = os.Stdout
+		}
+	}
+	{
+		if fl.grpcAddr != "" {
+			p, err := grpc_client.New(fl.grpcAddr, "")//fl.grpcCertFile)
+			if err != nil {
+				log.Error("Can't connect to gRPC:", err)
+				logFile.Close()
+				resFile.Close()
+				os.Exit(1)
+			}
+
+			urlStore = p
+		} else {
+			urlStore = stdmap.New()
+		}
+	}
+}
+
+type flags struct {
+	omitExtensions   []string
+	totalDepth       int
+	try             int
+	defaultExtNeeded bool
+	clientTimeout int
+	userAgent     string
+	headerFile    string
+	minHalt       int
+	maxHalt       int
+	deltaSuccess  float32
+	deltaFail     float32
+	resultFile    string
+	logFile       string
+	grpcAddr      string
+	grpcCertFile  string
+}
+
 func flagsInit() flags {
 	fl := flags{}
 	haltMinMax := ""
 	delta := ""
 	omitExtensions := ""
 
-	flag.IntVar(&workersNum, "n", runtime.NumCPU()*workersPerLogCPUdef, "Parallel requests num (workers); Default: `runtime.NumCPU() * 6` ->")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stdout, "Usage: %s [OPTIONS]\n\nhttp crawler cli\n\nOptions:\n", os.Args[0])
+
+		flag.VisitAll(func(f *flag.Flag) {
+			if f.DefValue != "" {
+				fmt.Fprintf(os.Stdout, "    -%-20s%s (default %s)\n\n", f.Name, f.Usage, f.DefValue)
+			} else {
+				fmt.Fprintf(os.Stdout, "    -%-20s%s\n\n", f.Name, f.Usage)
+			}
+		})
+	}
+
+	flag.IntVar(&workersNum, "n", workersDef, "Parallel requests num (workers)")
 	flag.StringVar(&rootPage, "root", "", "URL from to start, scheme required")
-	flag.IntVar(&totalDepth, "r", 0, "Recursion depth")
+	flag.IntVar(&fl.totalDepth, "r", 0, "Recursion depth")
 	flag.StringVar(&fl.userAgent, "user-agent", "", "HTTP User-Agent header")
-	flag.StringVar(&fl.headerFile, "header-file", "", "HTTP headers in format `HeaderName` newline `HeaderValue`")
-	flag.IntVar(&fl.clientTimeout, "client-timeout", clientTimeoutDef, "HTTP client timeout in ms")
-	flag.StringVar(&haltMinMax, "halt-min-max", haltMinMaxDef, "Min,max halt time per worker in ms to slow down and get less refused requests. Initial halt time is min. Usage: `200,4000`")
-	flag.StringVar(&delta, "delta-ok-fail", deltaOKfailDef, "Abstract deltas[knobs] in float for success/fail request. Usage: `1,-2`. Example: `overallSuccessRate += [ok/fail delta]; if (oSR <= -10) { haltTime *= constFor(-10) }`, watch `needHaltUpd()` and `haltCtrl()`")
+	flag.StringVar(&fl.headerFile, "header-file", "", "HTTP headers file in format 'HeaderName' newline 'HeaderValue'")
+	flag.StringVar(&omitExtensions, "omit-ext", "", "Omit parsing URLs with extensions. Usage: '.mp5 .mkv'. Generally it checks a suffix of URL, so it can pass all 'index.html', but leave '.html'. Default: '.png, .ico, .svg, .jpg, .ogv, .mp4, .aac, .mp3, .mov, .gif, .css, .pdf'; To off default add '-', like '- .mp5 .mkv' or just '-'")
+	flag.IntVar(&fl.clientTimeout, "client-timeout", clientTimeoutDef, "HTTP client-timeout in ms")
+	flag.IntVar(&fl.try, "retry", retryDef, "Times to retry refused URL request")
+	flag.StringVar(&haltMinMax, "halt-min-max", haltMinMaxDef, "'Min,max' halt time per worker in ms to slow down and get less refused requests. Initial halt time is min. Usage: '200,4000'")
+	flag.StringVar(&delta, "delta-ok-fail", deltaOKfailDef, `Abstract deltas[knobs] in float for success/fail request. Usage: ok,fail='1,-2'. Example: 'overallSuccessRate += [ok/fail delta]; if (oSR <= -10) { haltTime *= constFor(-10) }', watch 'needHaltUpd()' and 'haltCtrl()'`)
 	flag.StringVar(&fl.resultFile, "out-file", "", "File path for result to write. If file exists -> will append (default stdout)")
 	flag.StringVar(&fl.logFile, "log-file", "", "File path for logs to write. If flag is set – will use JSON format. If file exists -> will append (default stdout)")
-	flag.IntVar(&tryAllowed, "try", retryDef, "Times to retry refused URL request")
-	flag.StringVar(&omitExtensions, "omit-ext", "", "Omit parsing URLs with extensions. Generally it checks a suffix of URL, so it can pass all `index.html`, but leave `.html`. Default is: `.png, .ico, .svg, .jpg, .ogv, .mp4, .aac, .mp3, .mov, .gif, .css, .pdf`; Usage: `.mp5 .mkv`; To off default add `-`, like `- .mp5 .mkv` or just `-`")
+	flag.StringVar(&fl.grpcAddr, "grpc-addr", "", "Address for gRPC uniq URL store to connect. Must satisfy uniqURL_store/uniqURL_store.proto")
+	//flag.StringVar(&fl.grpcCertFile, "grpc-cert-file", "", "SSL/TLS cert file for gRPC client (if needed)")
 	flag.Parse()
+
 
 	if fl.logFile != "" {
 		var err error
 		logFile, err = os.OpenFile(fl.logFile,
 			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			defer logFile.Close()
 			log.Fatal("Can't open or create log file:", err)
 		}
 
@@ -699,7 +739,7 @@ func checkFormat(fl *flags, haltMinMax, delta, omitExtensions string) {
 	} else if !isURLvalid(rootPage) {
 		errs += "–> Value of `root` must be in valid format: http[s]://URL\n"
 	}
-	if totalDepth < 1 {
+	if fl.totalDepth < 1 {
 		errs += "–> Value of flag `r` must present and be > 0\n"
 	}
 	if fl.clientTimeout < 1 {
@@ -763,8 +803,9 @@ func checkFormat(fl *flags, haltMinMax, delta, omitExtensions string) {
 	}
 
 	if errs != "" {
-		defer logFile.Close()
-		log.WithField("type", "bad format").Fatal(errs)
+		log.WithField("type", "bad format").Error("\n", errs, "\n")
+		logFile.Close()
+		os.Exit(1)
 	}
 }
 
@@ -780,4 +821,24 @@ func isURLvalid(toTest string) bool {
 	}
 
 	return true
+}
+
+func getChanCapByDepth() int32 {
+	n := int32(workersNum)
+
+	//actually need more,
+	//need tests on big depth
+
+	switch totalDepth {
+	case 1:
+		return n
+	case 2:
+		return 70 + n
+	case 3:
+		//70^2=4900
+		return 70*70 + n
+	default:
+		//70^3=343000
+		return 10000 + n
+	}
 }
